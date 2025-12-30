@@ -459,7 +459,6 @@ class ChatApp(QWidget):
         self.attached_file_path: str | None = None
         self.attached_image_path: str | None = None
 
-        # ✅ FIX: start KBInitWorker at app startup and keep a reference to it
         self.kb_worker = KBInitWorker(self)
         self.kb_worker.status.connect(self.on_worker_status)
         self.kb_worker.start()
