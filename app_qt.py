@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from mevzuat_kb import MevzuatKB
+
 import requests
 from bs4 import BeautifulSoup
 from unstructured.partition.auto import partition
@@ -27,6 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 USERS_FILE = BASE_DIR / "users.json"
 HISTORY_DIR = BASE_DIR / "history"
 HISTORY_DIR.mkdir(exist_ok=True)
+KB = MevzuatKB(BASE_DIR)
 
 
 def _find_first_url(text: str) -> str | None:
@@ -237,6 +240,15 @@ class LoginDialog(QDialog):
         self.is_guest = True
         self.accept()
 
+class KBInitWorker(QThread):
+    status = Signal(str)
+    def run(self):
+        try:
+            self.status.emit("Indexing EMU mevzuat...")
+            KB.ensure_index(refresh_days=14)
+            self.status.emit("EMU mevzuat index ready.")
+        except Exception as e:
+            self.status.emit(f"EMU mevzuat index failed: {e}")
 
 class ChatWorker(QThread):
     finished = Signal(str)
