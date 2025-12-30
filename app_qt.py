@@ -240,8 +240,10 @@ class LoginDialog(QDialog):
         self.is_guest = True
         self.accept()
 
+
 class KBInitWorker(QThread):
     status = Signal(str)
+
     def run(self):
         try:
             self.status.emit("Indexing EMU mevzuat...")
@@ -249,6 +251,7 @@ class KBInitWorker(QThread):
             self.status.emit("EMU mevzuat index ready.")
         except Exception as e:
             self.status.emit(f"EMU mevzuat index failed: {e}")
+
 
 class ChatWorker(QThread):
     finished = Signal(str)
@@ -455,6 +458,11 @@ class ChatApp(QWidget):
         self.current_worker: ChatWorker | None = None
         self.attached_file_path: str | None = None
         self.attached_image_path: str | None = None
+
+        # ✅ FIX: start KBInitWorker at app startup and keep a reference to it
+        self.kb_worker = KBInitWorker(self)
+        self.kb_worker.status.connect(self.on_worker_status)
+        self.kb_worker.start()
 
         self.setAcceptDrops(True)
 
