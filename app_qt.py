@@ -1,21 +1,24 @@
 import sys
 import json
 import re
-import requests
-from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+import requests
+from bs4 import BeautifulSoup
+from unstructured.partition.auto import partition
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QLabel,
     QFileDialog, QDialog, QFormLayout, QDialogButtonBox,
-    QMessageBox, QListWidget, QListWidgetItem, QFrame, QScrollArea
+    QMessageBox, QListWidget, QListWidgetItem,
+    QFrame, QScrollArea, QProgressBar
 )
 from PySide6.QtCore import (
-    Qt, QRectF, Property, QPropertyAnimation, Signal, QThread, QSize
+    Qt, QRectF, Property, QPropertyAnimation, Signal, QThread, QSize, QTimer, QUrl
 )
-from PySide6.QtGui import QPainter, QColor, QIcon, QPixmap
+from PySide6.QtGui import QPainter, QColor, QIcon, QPixmap, QDesktopServices
 
 from main import chat_with_gpt
 
@@ -32,6 +35,7 @@ def _find_first_url(text: str) -> str | None:
     m = re.search(r"https?://[^\s]+", text)
     return m.group(0).rstrip(").,]}>\"'") if m else None
 
+
 def _extract_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -39,6 +43,7 @@ def _extract_text_from_html(html: str) -> str:
     text = soup.get_text(separator="\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return "\n".join(lines)
+
 
 def fetch_url_text(url: str, max_chars: int = 40_000) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -55,10 +60,13 @@ def fetch_url_text(url: str, max_chars: int = 40_000) -> str:
     else:
         text = _extract_text_from_html(r.text)
 
-    if len(text) > max_chars:
-        text = text[:max_chars]
+    return text[:max_chars] if len(text) > max_chars else text
 
-    return text
+
+def extract_text_with_unstructured(path: str) -> str:
+    elements = partition(filename=path)
+    return "\n".join(el.text for el in elements if getattr(el, "text", None))
+
 
 def load_users():
     if USERS_FILE.exists():
@@ -90,12 +98,9 @@ def load_history(username: str, is_guest: bool):
 
     if not data:
         return []
+
     if isinstance(data, list) and isinstance(data[0], dict) and "messages" not in data[0]:
-        chat = {
-            "id": datetime.now(timezone.utc).isoformat(),
-            "summary": "",
-            "messages": data
-        }
+        chat = {"id": datetime.now(timezone.utc).isoformat(), "summary": "", "messages": data}
         data = [chat]
 
     if is_guest:
@@ -118,17 +123,15 @@ def save_history(username: str, chats):
     f = history_file_for_user(username)
     f.write_text(json.dumps(chats, indent=2), encoding="utf-8")
 
+
 class ToggleSwitch(QWidget):
     toggled = Signal(bool)
 
     def __init__(self, checked=True, parent=None):
         super().__init__(parent)
-
         self.setFixedSize(56, 30)
-
         self._checked = checked
         self._offset = 26 if checked else 2
-
         self._anim = QPropertyAnimation(self, b"offset", self)
         self._anim.setDuration(180)
 
@@ -138,12 +141,10 @@ class ToggleSwitch(QWidget):
     def setChecked(self, checked):
         if self._checked == checked:
             return
-
         self._checked = checked
         self._anim.stop()
         self._anim.setEndValue(26 if checked else 2)
         self._anim.start()
-
         self.toggled.emit(self._checked)
 
     def paintEvent(self, event):
@@ -186,7 +187,6 @@ class LoginDialog(QDialog):
         self.username_edit = QLineEdit()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
-
         form.addRow("Username:", self.username_edit)
         form.addRow("Password:", self.password_edit)
         layout.addLayout(form)
@@ -237,20 +237,42 @@ class LoginDialog(QDialog):
         self.is_guest = True
         self.accept()
 
+
 class ChatWorker(QThread):
     finished = Signal(str)
+    status = Signal(str)
+    busy = Signal(bool)
 
-    def __init__(self, prompt: str, image_path: str | None = None, parent=None):
+    def __init__(self, prompt: str, image_path: str | None = None, file_path: str | None = None, parent=None):
         super().__init__(parent)
         self.prompt = prompt
         self.image_path = image_path
+        self.file_path = file_path
 
     def run(self):
-        prompt = self.prompt or ""
-        url = _find_first_url(prompt)
+        self.busy.emit(True)
 
+        prompt = self.prompt or ""
+
+        if self.file_path:
+            try:
+                self.status.emit("Reading file...")
+                file_text = extract_text_with_unstructured(self.file_path)
+                if len(file_text) > 60_000:
+                    file_text = file_text[:60_000]
+                prompt = (
+                    f"{prompt}\n\n"
+                    f"FILE: {Path(self.file_path).name}\n"
+                    "CONTENT:\n"
+                    f"{file_text}"
+                )
+            except Exception as e:
+                prompt = f"{prompt}\n\nI couldn't read the attached file: {e}"
+
+        url = _find_first_url(prompt)
         if url:
             try:
+                self.status.emit("Fetching link...")
                 extracted = fetch_url_text(url)
                 prompt = (
                     "Summarize this publication clearly:\n\n"
@@ -271,8 +293,12 @@ class ChatWorker(QThread):
                     "Please paste the text or upload the PDF content, and I will summarize it."
                 )
 
+        self.status.emit("Thinking...")
         reply = chat_with_gpt(prompt, self.image_path)
+
+        self.busy.emit(False)
         self.finished.emit(reply)
+
 
 class HistoryDialog(QDialog):
     def __init__(self, chats, parent=None):
@@ -313,14 +339,12 @@ class HistoryDialog(QDialog):
             return
 
         chat = item.data(Qt.UserRole)
-
         confirm = QMessageBox.question(
             self,
             "Delete Chat",
             "Are you sure you want to delete this chat?",
             QMessageBox.Yes | QMessageBox.No
         )
-
         if confirm != QMessageBox.Yes:
             return
 
@@ -332,8 +356,9 @@ class HistoryDialog(QDialog):
 
         self.accept()
 
+
 class ChatBubble(QWidget):
-    def __init__(self, text="", is_user=True, image_path=None):
+    def __init__(self, text="", is_user=True, image_path=None, file_path=None):
         super().__init__()
 
         layout = QHBoxLayout(self)
@@ -343,6 +368,25 @@ class ChatBubble(QWidget):
         bubble_layout = QVBoxLayout(bubble_widget)
         bubble_layout.setSpacing(6)
         bubble_layout.setContentsMargins(10, 8, 10, 8)
+
+        if file_path:
+            btn = QPushButton(f"📎 {Path(file_path).name}")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(file_path)))
+            btn.setStyleSheet("""
+                QPushButton {
+                    text-align: left;
+                    padding: 8px 10px;
+                    border-radius: 10px;
+                    background: rgba(255,255,255,0.10);
+                    border: 1px solid rgba(255,255,255,0.15);
+                    color: white;
+                }
+                QPushButton:hover {
+                    background: rgba(255,255,255,0.16);
+                }
+            """)
+            bubble_layout.addWidget(btn)
 
         if image_path:
             img = QLabel()
@@ -380,14 +424,10 @@ class ChatBubble(QWidget):
             layout.addWidget(bubble_widget)
             layout.addStretch()
 
-class ChatApp(QWidget):
 
+class ChatApp(QWidget):
     def create_new_chat(self):
-        return {
-            "id": datetime.now(timezone.utc).isoformat(),
-            "summary": "",
-            "messages": []
-        }
+        return {"id": datetime.now(timezone.utc).isoformat(), "summary": "", "messages": []}
 
     def __init__(self, username: str, is_guest: bool):
         super().__init__()
@@ -401,6 +441,7 @@ class ChatApp(QWidget):
         self.chats = load_history(self.username, self.is_guest)
         self.active_chat = self.create_new_chat()
         self.current_worker: ChatWorker | None = None
+        self.attached_file_path: str | None = None
         self.attached_image_path: str | None = None
 
         self.setAcceptDrops(True)
@@ -441,7 +482,6 @@ class ChatApp(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.chat_widget)
         self.scroll.setFrameShape(QFrame.NoFrame)
-
         self.main_layout.addWidget(self.scroll, stretch=1)
 
         self.image_preview = QLabel()
@@ -449,12 +489,38 @@ class ChatApp(QWidget):
         self.image_preview.hide()
         self.main_layout.addWidget(self.image_preview)
 
+        self.scroll_down_btn = QPushButton("↓", self)
+        self.scroll_down_btn.setFixedSize(44, 44)
+        self.scroll_down_btn.setToolTip("Jump to newest message")
+        self.scroll_down_btn.clicked.connect(self.scroll_to_bottom)
+        self.scroll_down_btn.hide()
+        self.scroll_down_btn.raise_()
+        self.scroll_down_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(44, 44, 44, 0.9);
+                border-radius: 22px;
+                font-size: 18px;
+                color: white;
+            }
+            QPushButton:hover {
+                background: rgba(60, 60, 60, 1.0);
+            }
+        """)
+        self.scroll.verticalScrollBar().valueChanged.connect(lambda _: self.update_scroll_button_visibility())
+
         self.typing_label = QLabel("")
         self.typing_label.setStyleSheet("font-size: 12px; color: #888888;")
         self.main_layout.addWidget(self.typing_label)
 
-        input_frame = QFrame()
-        input_layout = QHBoxLayout(input_frame)
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(10)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        self.main_layout.addWidget(self.progress)
+
+        self.input_frame = QFrame()
+        input_layout = QHBoxLayout(self.input_frame)
         input_layout.setContentsMargins(10, 4, 10, 4)
         input_layout.setSpacing(6)
 
@@ -466,7 +532,7 @@ class ChatApp(QWidget):
         attach_btn.setIcon(QIcon("icons/attach.svg"))
         attach_btn.setIconSize(QSize(18, 18))
         attach_btn.setFixedSize(36, 36)
-        attach_btn.clicked.connect(self.attach_image)
+        attach_btn.clicked.connect(self.attach_file)
 
         send_btn = QPushButton()
         send_btn.setIcon(QIcon("icons/send.svg"))
@@ -479,7 +545,7 @@ class ChatApp(QWidget):
         input_layout.addWidget(attach_btn)
         input_layout.addWidget(send_btn)
 
-        input_frame.setStyleSheet("""
+        self.input_frame.setStyleSheet("""
             QFrame {
                 background: #1e1e1e;
                 border-radius: 18px;
@@ -498,13 +564,19 @@ class ChatApp(QWidget):
                 background: rgba(255, 255, 255, 0.08);
             }
         """)
+        self.main_layout.addWidget(self.input_frame)
 
-        self.main_layout.addWidget(input_frame)
+        QTimer.singleShot(0, self.update_scroll_button_visibility)
 
         self.apply_theme()
 
         if self.chats:
             self.load_chat(self.chats[-1])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.scroll_down_btn.isVisible():
+            self.position_scroll_button()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -512,22 +584,47 @@ class ChatApp(QWidget):
 
     def dropEvent(self, event):
         urls = event.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
-                self.attached_image_path = path
-                self.show_image_preview(path)
+        if not urls:
+            return
+
+        path = urls[0].toLocalFile()
+        ext = Path(path).suffix.lower()
+
+        if ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp"]:
+            self.attached_image_path = path
+            self.attached_file_path = None
+            self.show_image_preview(path)
+            return
+
+        if ext in [".pdf", ".docx", ".txt", ".pptx", ".xlsx"]:
+            self.attached_file_path = path
+            self.attached_image_path = None
+            self.show_file_preview(path)
+
+    def scroll_to_bottom(self):
+        QTimer.singleShot(
+            0,
+            lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+        )
+
+    def is_near_bottom(self, threshold: int = 80) -> bool:
+        vbar = self.scroll.verticalScrollBar()
+        return (vbar.maximum() - vbar.value()) <= threshold
 
     def set_ui_busy(self, busy: bool):
         self.entry.setDisabled(busy)
         self.send_btn.setDisabled(busy)
 
-    def add_message(self, text, is_user=True, image_path=None):
-        bubble = ChatBubble(text, is_user=is_user, image_path=image_path)
-        self.chat_layout.addWidget(bubble)
-        # auto-scroll to bottom
-        vbar = self.scroll.verticalScrollBar()
-        vbar.setValue(vbar.maximum())
+    def on_worker_busy(self, is_busy: bool):
+        self.set_ui_busy(is_busy)
+        if is_busy:
+            self.progress.show()
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.hide()
+
+    def on_worker_status(self, text: str):
+        self.typing_label.setText(text)
 
     def start_new_chat(self):
         if self.active_chat["messages"]:
@@ -552,12 +649,24 @@ class ChatApp(QWidget):
 
         self.active_chat = chat
 
-        for msg in chat["messages"]:
+        for msg in chat.get("messages", []):
             self.add_message(
                 msg.get("content", ""),
                 is_user=(msg.get("role") == "user"),
-                image_path=msg.get("image")
+                image_path=msg.get("image"),
+                file_path=msg.get("file")
             )
+
+    def add_message(self, text, is_user=True, image_path=None, file_path=None):
+        should_follow = self.is_near_bottom()
+
+        bubble = ChatBubble(text, is_user=is_user, image_path=image_path, file_path=file_path)
+        self.chat_layout.addWidget(bubble)
+
+        if should_follow:
+            self.scroll_to_bottom()
+
+        self.update_scroll_button_visibility()
 
     def show_history_dialog(self):
         dlg = HistoryDialog(self.chats, self)
@@ -569,60 +678,81 @@ class ChatApp(QWidget):
         self.image_preview.show()
         self.typing_label.setText(f"Attached image: {Path(path).name}")
 
-    def attach_image(self):
+    def show_file_preview(self, path: str):
+        self.image_preview.hide()
+        self.typing_label.setText(f"Attached file: {Path(path).name}")
+
+    def attach_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Attach image",
+            "Attach file",
             "",
-            "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"
+            "Supported Files (*.png *.jpg *.jpeg *.webp *.bmp *.pdf *.docx *.txt *.pptx *.xlsx);;All Files (*)"
         )
-        if file_path:
-            self.attached_image_path = file_path
-            self.show_image_preview(file_path)
-        else:
+        if not file_path:
+            self.attached_file_path = None
             self.attached_image_path = None
             self.image_preview.hide()
             self.typing_label.setText("")
+            return
+
+        ext = Path(file_path).suffix.lower()
+        if ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp"]:
+            self.attached_image_path = file_path
+            self.attached_file_path = None
+            self.show_image_preview(file_path)
+        else:
+            self.attached_file_path = file_path
+            self.attached_image_path = None
+            self.show_file_preview(file_path)
 
     def handle_send_clicked(self):
         text = self.entry.text().strip()
-        if not text and not self.attached_image_path:
+        if not text and not self.attached_image_path and not self.attached_file_path:
             return
         self.send_message(text)
 
     def send_message(self, text: str):
-        if not text and not self.attached_image_path:
+        if not text and not self.attached_image_path and not self.attached_file_path:
             return
 
+        file_path = self.attached_file_path
         img_path = self.attached_image_path
 
-        user_content = text
-        if img_path:
-            user_content = text or ""
-        self.add_message(user_content or "[Image]", is_user=True, image_path=img_path)
+        if file_path:
+            self.add_message(text or "", is_user=True, file_path=file_path)
+            self.active_chat["messages"].append({
+                "role": "user",
+                "content": text,
+                "image": None,
+                "file": file_path
+            })
+        else:
+            self.add_message(text or "[Image]", is_user=True, image_path=img_path)
+            self.active_chat["messages"].append({
+                "role": "user",
+                "content": text,
+                "image": img_path,
+                "file": None
+            })
 
-        self.active_chat["messages"].append({
-            "role": "user",
-            "content": text,
-            "image": img_path
-        })
         if self.active_chat not in self.chats:
             self.chats.append(self.active_chat)
         save_history(self.username, self.chats)
 
         self.entry.clear()
         self.attached_image_path = None
+        self.attached_file_path = None
         self.image_preview.hide()
 
-        self.typing_label.setText("ChatBot is typing...")
-        self.set_ui_busy(True)
-
-        self.current_worker = ChatWorker(text, img_path)
+        self.typing_label.setText("Starting...")
+        self.current_worker = ChatWorker(text, img_path, file_path)
         self.current_worker.finished.connect(self.on_bot_reply)
+        self.current_worker.status.connect(self.on_worker_status)
+        self.current_worker.busy.connect(self.on_worker_busy)
         self.current_worker.start()
 
     def on_bot_reply(self, reply: str):
-        self.set_ui_busy(False)
         self.typing_label.setText("")
         self.add_message(reply, is_user=False)
 
@@ -630,19 +760,35 @@ class ChatApp(QWidget):
         self.active_chat["messages"].append({
             "role": "bot",
             "content": reply,
-            "image": None
+            "image": None,
+            "file": None
         })
 
         save_history(self.username, self.chats)
 
-        if not self.active_chat["summary"]:
-            first_user = next(
-                (m["content"] for m in self.active_chat["messages"] if m["role"] == "user"),
-                ""
-            )
-            self.active_chat["summary"] = (
-                first_user[:40] + "…" if len(first_user) > 40 else first_user
-            )
+        if not self.active_chat.get("summary"):
+            first_user = next((m.get("content", "") for m in self.active_chat["messages"] if m.get("role") == "user"), "")
+            self.active_chat["summary"] = (first_user[:40] + "…" if len(first_user) > 40 else first_user)
+            save_history(self.username, self.chats)
+
+        if self.is_near_bottom():
+            self.scroll_to_bottom()
+
+    def update_scroll_button_visibility(self):
+        if self.is_near_bottom():
+            self.scroll_down_btn.hide()
+        else:
+            self.scroll_down_btn.show()
+            self.position_scroll_button()
+
+    def position_scroll_button(self):
+        margin = 12
+        btn_w = self.scroll_down_btn.width()
+        btn_h = self.scroll_down_btn.height()
+        input_geom = self.input_frame.geometry()
+        x = self.width() - btn_w - margin
+        y = input_geom.y() - btn_h - margin
+        self.scroll_down_btn.move(x, y)
 
     def on_theme_toggled(self, is_dark: bool):
         self.dark_mode = is_dark
@@ -655,42 +801,29 @@ class ChatApp(QWidget):
     def apply_theme(self):
         if self.dark_mode:
             self.setStyleSheet("""
-                QWidget {
-                    background: #121212;
-                    color: white;
-                }
-                QLabel {
-                    color: white;
-                }
+                QWidget { background: #121212; color: white; }
+                QLabel { color: white; }
                 QPushButton {
                     background: #2c2c2c;
                     border-radius: 6px;
                     padding: 6px;
                     color: white;
                 }
-                QPushButton:hover {
-                    background: #3a3a3a;
-                }
+                QPushButton:hover { background: #3a3a3a; }
             """)
         else:
             self.setStyleSheet("""
-                QWidget {
-                    background: #ffffff;
-                    color: black;
-                }
-                QLabel {
-                    color: black;
-                }
+                QWidget { background: #ffffff; color: black; }
+                QLabel { color: black; }
                 QPushButton {
                     background: #dddddd;
                     border-radius: 6px;
                     padding: 6px;
                     color: black;
                 }
-                QPushButton:hover {
-                    background: #cccccc;
-                }
+                QPushButton:hover { background: #cccccc; }
             """)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
